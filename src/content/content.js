@@ -2,8 +2,12 @@
   const STORAGE = window.RememberOperationStorage;
   const ROOT_ID = "remember-operation-root";
   const REPLAY_MASK_ID = "remember-operation-replay-mask";
+  const PATH_CONFIRM_ID = "remember-operation-path-confirm";
+  const PENDING_REPLAY_KEY = "rememberOperationPendingReplay";
   const MASKED_VALUE = "__remember_operation_masked__";
   const REPLAY_STEP_DELAY_MS = 800;
+  const RESUME_REPLAY_DELAY_MS = 1500;
+  const UNSAFE_REPLAY_CLICK_PATTERN = /rtl|ltr|direction|flip|mirror|reverse|layout|locale|language|i18n|translate|翻转|镜像|方向|布局|语言|翻译/i;
   const OPTION_SELECTORS = [
     "option",
     ".el-select-dropdown__item",
@@ -76,14 +80,6 @@
     ".arco-btn",
     "a"
   ].join(",");
-  const RECORDED_CLICKABLE_SELECTOR = [
-    CLICKABLE_SELECTOR,
-    "[role='option']",
-    "[role='treeitem']",
-    ".arco-select-option",
-    ".arco-select-option-content"
-  ].join(",");
-
   let panelRoot = null;
   let panelOpen = false;
   let isRecording = false;
@@ -92,6 +88,7 @@
   let recordBuffer = [];
   let recordStartedAt = 0;
   let currentDetail = null;
+  let pendingPathReplay = null;
   let lastRouteKey = "";
   let recordingFilters = {
     scope: "all",
@@ -120,6 +117,42 @@
       rect.height > 0;
   }
 
+  function captureHorizontalScrollState() {
+    const nodes = [document.documentElement, document.body];
+    document.querySelectorAll("*").forEach((node) => {
+      if (node instanceof Element && node.scrollWidth > node.clientWidth) {
+        nodes.push(node);
+      }
+    });
+
+    return nodes
+      .filter(Boolean)
+      .map((node) => ({
+        node,
+        scrollLeft: node.scrollLeft
+      }));
+  }
+
+  function restoreHorizontalScrollState(state) {
+    state.forEach(({ node, scrollLeft }) => {
+      if (node && node.scrollLeft !== scrollLeft) {
+        node.scrollLeft = scrollLeft;
+      }
+    });
+  }
+
+  function restoreHorizontalScrollStateSoon(state) {
+    restoreHorizontalScrollState(state);
+    window.requestAnimationFrame(() => restoreHorizontalScrollState(state));
+    window.setTimeout(() => restoreHorizontalScrollState(state), 80);
+  }
+
+  function scrollElementIntoReplayView(element) {
+    const horizontalScrollState = captureHorizontalScrollState();
+    element.scrollIntoView({ block: "center", inline: "nearest" });
+    restoreHorizontalScrollState(horizontalScrollState);
+  }
+
   function cssEscape(value) {
     if (window.CSS && window.CSS.escape) {
       return window.CSS.escape(value);
@@ -133,6 +166,7 @@
     return {
       host: location.host,
       path: location.pathname,
+      pagePath: location.pathname,
       title: normalizeText(document.title),
       dialogTitle,
       key: [
@@ -141,6 +175,115 @@
         dialogTitle || "page"
       ].join("::")
     };
+  }
+
+  function getRecordingPath(recording) {
+    return recording && recording.scope
+      ? (recording.scope.pagePath || recording.scope.path || "")
+      : "";
+  }
+
+  function validateReplayPath(recording) {
+    const recordedPath = getRecordingPath(recording);
+    const currentPath = location.pathname;
+    if (!recordedPath || recordedPath === currentPath) {
+      return {
+        ok: true,
+        recordedPath,
+        currentPath
+      };
+    }
+
+    return {
+      ok: false,
+      recordedPath,
+      currentPath,
+      message: `回放失败：当前页面 path 不匹配。录制 path：${recordedPath}，当前 path：${currentPath}`
+    };
+  }
+
+  function setPendingReplay(id) {
+    window.sessionStorage.setItem(PENDING_REPLAY_KEY, JSON.stringify({
+      id,
+      createdAt: Date.now()
+    }));
+  }
+
+  function consumePendingReplay() {
+    const raw = window.sessionStorage.getItem(PENDING_REPLAY_KEY);
+    if (!raw) {
+      return null;
+    }
+
+    window.sessionStorage.removeItem(PENDING_REPLAY_KEY);
+    try {
+      const pending = JSON.parse(raw);
+      if (!pending || !pending.id || Date.now() - pending.createdAt > 60000) {
+        return null;
+      }
+      return pending;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function buildPathUrl(path) {
+    return `${location.origin}${path}`;
+  }
+
+  function hidePathConfirm() {
+    const confirm = document.getElementById(PATH_CONFIRM_ID);
+    if (confirm) {
+      confirm.remove();
+    }
+    pendingPathReplay = null;
+  }
+
+  function showPathMismatchConfirm(recording, pathCheck) {
+    hidePathConfirm();
+    pendingPathReplay = {
+      id: recording.id,
+      path: pathCheck.recordedPath
+    };
+
+    updatePanelStatus(pathCheck.message, "error");
+
+    const confirm = document.createElement("div");
+    confirm.id = PATH_CONFIRM_ID;
+    confirm.className = "ro-path-confirm";
+    confirm.innerHTML = `
+      <div class="ro-path-confirm-card">
+        <div class="ro-path-confirm-title">当前页面 path 不匹配</div>
+        <div class="ro-path-confirm-message">
+          <div>录制 path：${escapeHtml(pathCheck.recordedPath)}</div>
+          <div>当前 path：${escapeHtml(pathCheck.currentPath)}</div>
+        </div>
+        <div class="ro-path-confirm-actions">
+          <button class="ro-button primary" data-ro-action="jump-and-replay" type="button">跳转并回放</button>
+          <button class="ro-button" data-ro-action="cancel-path-replay" type="button">取消</button>
+        </div>
+      </div>
+    `;
+    document.documentElement.appendChild(confirm);
+    confirm.querySelector("[data-ro-action='jump-and-replay']").addEventListener("click", jumpAndReplayPending);
+    confirm.querySelector("[data-ro-action='cancel-path-replay']").addEventListener("click", () => {
+      hidePathConfirm();
+      updatePanelStatus("已取消跳转回放。");
+    });
+  }
+
+  function jumpAndReplayPending() {
+    if (!pendingPathReplay || !pendingPathReplay.id || !pendingPathReplay.path) {
+      hidePathConfirm();
+      updatePanelStatus("没有可跳转回放的任务。", "error");
+      return;
+    }
+
+    const { id, path } = pendingPathReplay;
+    setPendingReplay(id);
+    hidePathConfirm();
+    updatePanelStatus(`正在跳转到：${path}`);
+    location.assign(buildPathUrl(path));
   }
 
   function getRouteKey() {
@@ -160,6 +303,7 @@
       renderDetail();
       await updatePanelMeta();
       await renderRecordings();
+      await resumePendingReplay();
     }, 120);
   }
 
@@ -183,6 +327,18 @@
 
     window.addEventListener("popstate", scheduleRouteRefresh);
     window.addEventListener("hashchange", scheduleRouteRefresh);
+  }
+
+  async function resumePendingReplay() {
+    const pending = consumePendingReplay();
+    if (!pending) {
+      return;
+    }
+
+    togglePanel(true);
+    updatePanelStatus("已跳转，准备回放...");
+    await sleep(RESUME_REPLAY_DELAY_MS);
+    await replayRecording(pending.id);
   }
 
   function getActiveRoot() {
@@ -610,7 +766,7 @@
         continue;
       }
 
-      option.scrollIntoView({ block: "center", inline: "nearest" });
+      scrollElementIntoReplayView(option);
       safeClick(option);
       selected += 1;
       await sleep(120);
@@ -705,13 +861,84 @@
     return target.closest(`${CLICKABLE_SELECTOR}, [role='option'], [role='treeitem'], .arco-select-option, .arco-select-option-content`);
   }
 
-  function safeClick(target) {
-    const clickable = getClickableElement(target) || target;
+  function getReplayClickTarget(target) {
+    return getClickableElement(target) || target;
+  }
+
+  function getElementDebugText(el) {
+    if (!el || !(el instanceof Element)) {
+      return "unknown";
+    }
+
+    const parts = [el.tagName.toLowerCase()];
+    const id = el.getAttribute("id");
+    const role = el.getAttribute("role");
+    const title = el.getAttribute("title");
+    const aria = el.getAttribute("aria-label");
+    const classes = Array.from(el.classList || []).slice(0, 4);
+    if (id) {
+      parts.push(`#${id}`);
+    }
+    if (classes.length) {
+      parts.push(`.${classes.join(".")}`);
+    }
+    if (role) {
+      parts.push(`[role=${role}]`);
+    }
+    if (title) {
+      parts.push(`[title=${title}]`);
+    }
+    if (aria) {
+      parts.push(`[aria-label=${aria}]`);
+    }
+    return parts.join("");
+  }
+
+  function getElementSafetyText(el) {
+    const values = [];
+    let current = el;
+    let depth = 0;
+    while (current && current instanceof Element && current !== document.body && depth < 3) {
+      ["id", "class", "title", "aria-label", "aria-describedby", "data-testid", "data-test", "data-action", "data-name"].forEach((name) => {
+        const value = current.getAttribute(name);
+        if (value) {
+          values.push(value);
+        }
+      });
+      values.push(normalizeText(current.textContent).slice(0, 80));
+      current = current.parentElement;
+      depth += 1;
+    }
+    return values.join(" ");
+  }
+
+  function isUnsafeReplayClickTarget(target) {
+    const clickable = getReplayClickTarget(target);
     if (!clickable || !(clickable instanceof Element)) {
       return false;
     }
 
-    clickable.scrollIntoView({ block: "center", inline: "nearest" });
+    return UNSAFE_REPLAY_CLICK_PATTERN.test(getElementSafetyText(clickable));
+  }
+
+  function highlightReplayClickTarget(target) {
+    if (!target || !(target instanceof Element)) {
+      return;
+    }
+
+    target.classList.add("ro-replay-target-highlight");
+    window.setTimeout(() => {
+      target.classList.remove("ro-replay-target-highlight");
+    }, 900);
+  }
+
+  function safeClick(target) {
+    const clickable = getReplayClickTarget(target);
+    if (!clickable || !(clickable instanceof Element)) {
+      return false;
+    }
+
+    scrollElementIntoReplayView(clickable);
 
     ["pointerdown", "mousedown", "pointerup", "mouseup"].forEach((type) => {
       clickable.dispatchEvent(new MouseEvent(type, {
@@ -911,30 +1138,19 @@
         return null;
       }
 
-      current = candidates[entry.indexOfType] || candidates[0];
+      if (entry.indexOfType < 0 || entry.indexOfType >= candidates.length) {
+        return null;
+      }
+
+      current = candidates[entry.indexOfType];
     }
 
     return current instanceof Element && isVisible(current) ? current : null;
   }
 
-  function getUniqueClickables(root) {
-    const seen = new Set();
-    return Array.from(root.querySelectorAll(RECORDED_CLICKABLE_SELECTOR))
-      .map((node) => getClickableElement(node) || node)
-      .filter((node) => node && node instanceof Element && isVisible(node))
-      .filter((node) => {
-        if (seen.has(node)) {
-          return false;
-        }
-        seen.add(node);
-        return true;
-      });
-  }
-
   function buildClickLocator(target, event) {
     const scope = getRecordScope(target);
     const root = scope.root;
-    const clickables = getUniqueClickables(root);
     const clickable = getClickableElement(target) || target;
     const formItem = getFormItem(clickable);
     const composedPath = buildComposedElementPath(event, root);
@@ -950,7 +1166,6 @@
         : buildElementPath(target, root),
       clickablePath: buildElementPath(clickable, root),
       relativeSelector: getRelativeSelector(clickable, root),
-      clickableIndex: clickables.indexOf(clickable),
       formItemIndex: getFormItemIndex(formItem),
       fieldIdentity: formItem ? `form-item:${getFormItemIndex(formItem)}` : ""
     };
@@ -963,11 +1178,12 @@
 
     if (locator.scopeKind === "floating") {
       const roots = getVisibleFloatingRoots();
-      return roots[roots.length - 1] || roots[locator.scopeRootIndex] || document.body;
+      return roots[locator.scopeRootIndex] || roots[roots.length - 1] || null;
     }
 
     if (locator.scopeKind === "active-root") {
-      return getActiveRoot();
+      const activeRoot = getActiveRoot();
+      return activeRoot === document ? null : activeRoot;
     }
 
     return document.body;
@@ -992,6 +1208,10 @@
     }
 
     const root = resolveClickScope(locator);
+    if (!root) {
+      return null;
+    }
+
     const clickablePathMatch = resolveElementPath(root, locator.clickablePath);
     if (clickablePathMatch) {
       return getClickableElement(clickablePathMatch) || clickablePathMatch;
@@ -1015,10 +1235,6 @@
       if (pathMatch && isVisible(pathMatch)) {
         return getClickableElement(pathMatch) || pathMatch;
       }
-    }
-
-    if (locator.clickableIndex >= 0) {
-      return getUniqueClickables(root)[locator.clickableIndex] || null;
     }
 
     return null;
@@ -1241,6 +1457,11 @@
       showReplayFailure(recording.name || id, "录制没有可回放步骤");
       return { ok: false, message: "录制没有可回放步骤" };
     }
+    const pathCheck = validateReplayPath(recording);
+    if (!pathCheck.ok) {
+      showPathMismatchConfirm(recording, pathCheck);
+      return { ok: false, message: "当前页面 path 不匹配", pathMismatch: true };
+    }
 
     isReplaying = true;
     stopReplayRequested = false;
@@ -1248,6 +1469,7 @@
     updatePanelStatus(`正在回放：${recording.name}`);
     await updatePanelMeta();
 
+    const replayHorizontalScrollState = captureHorizontalScrollState();
     try {
       let missingTargetCount = 0;
       const missingTargetLimit = Math.max(1, Math.round(recording.steps.length / 3));
@@ -1256,9 +1478,12 @@
           break;
         }
 
+        const horizontalScrollState = captureHorizontalScrollState();
         try {
           await runReplayStep(step);
+          restoreHorizontalScrollStateSoon(horizontalScrollState);
         } catch (error) {
+          restoreHorizontalScrollStateSoon(horizontalScrollState);
           if (!isMissingTargetError(error)) {
             throw error;
           }
@@ -1293,6 +1518,7 @@
       showReplayFailure(recording.name, error.message);
       return { ok: false, message: error.message };
     } finally {
+      restoreHorizontalScrollStateSoon(replayHorizontalScrollState);
       isReplaying = false;
       stopReplayRequested = false;
       hideReplayMask();
@@ -1324,25 +1550,21 @@
     }
 
     if (step.action === "click") {
-      let target = resolveClickTarget(step);
-      if (!target && step.floating && step.text) {
-        target = findFloatingClickableByText(step.text);
-      }
-      if (!target && step.nearFieldLabel && step.text) {
-        target = findButtonNearField(step.nearFieldLabel, step.text);
-      }
-      if (!target && step.text) {
-        target = findClickableByText(step.text);
-      }
-      if (!target && step.selector) {
-        target = document.querySelector(step.selector);
-      }
+      const target = resolveClickTarget(step);
 
       if (!target || !isVisible(target)) {
         throw createMissingTargetError("无法匹配点击目标");
       }
 
-      const ok = safeClick(target);
+      const clickTarget = getReplayClickTarget(target);
+      if (isUnsafeReplayClickTarget(clickTarget)) {
+        throw createMissingTargetError(`疑似误匹配页面功能按钮，已跳过：${getElementDebugText(clickTarget)}`);
+      }
+
+      updatePanelStatus(`正在点击：${getElementDebugText(clickTarget)}`);
+      highlightReplayClickTarget(clickTarget);
+
+      const ok = safeClick(clickTarget);
       if (!ok) {
         throw new Error("点击目标失败");
       }
@@ -1356,78 +1578,6 @@
     const message = `回放失败：${name}${reason ? `，${reason}` : ""}`;
     updatePanelStatus(message, "error");
     showToast(message, "error");
-  }
-
-  function findButtonNearField(fieldLabel, buttonText) {
-    const normalizedLabel = normalizeText(fieldLabel);
-    const normalizedText = normalizeText(buttonText);
-    const formItems = Array.from(getActiveRoot().querySelectorAll(FORM_ITEM_SELECTOR));
-
-    const item = formItems.find((node) => cleanLabelText(node.querySelector(LABEL_SELECTOR)) === normalizedLabel) ||
-      formItems.find((node) => cleanLabelText(node.querySelector(LABEL_SELECTOR)).includes(normalizedLabel));
-    if (!item) {
-      return null;
-    }
-
-    return Array.from(item.querySelectorAll(CLICKABLE_SELECTOR))
-      .filter(isVisible)
-      .find((node) => normalizeText(node.textContent || node.getAttribute("aria-label") || node.getAttribute("title")).includes(normalizedText));
-  }
-
-  function findClickableByText(text) {
-    const normalized = normalizeText(text);
-    if (!normalized) {
-      return null;
-    }
-
-    const floating = findFloatingClickableByText(normalized);
-    if (floating) {
-      return floating;
-    }
-
-    return Array.from(getActiveRoot().querySelectorAll(`${CLICKABLE_SELECTOR}, [role='option'], [role='treeitem']`))
-      .filter(isVisible)
-      .find((node) => normalizeText(node.textContent).includes(normalized));
-  }
-
-  function findFloatingClickableByText(text) {
-    const normalized = normalizeText(text);
-    const floatingRoots = Array.from(document.querySelectorAll(FLOATING_ROOT_SELECTOR)).filter(isVisible);
-
-    for (const root of floatingRoots.reverse()) {
-      const exact = findClickableInside(root, normalized, true);
-      if (exact) {
-        return exact;
-      }
-
-      const partial = findClickableInside(root, normalized, false);
-      if (partial) {
-        return partial;
-      }
-    }
-
-    return null;
-  }
-
-  function findClickableInside(root, text, exact) {
-    const nodes = Array.from(root.querySelectorAll([
-      CLICKABLE_SELECTOR,
-      "[role='option']",
-      "[role='treeitem']",
-      ".arco-select-option",
-      ".arco-select-option-content",
-      ".arco-select-footer",
-      ".arco-link",
-      "span",
-      "div"
-    ].join(","))).filter(isVisible);
-
-    const match = nodes.find((node) => {
-      const nodeText = normalizeText(node.textContent || node.getAttribute("aria-label") || node.getAttribute("title"));
-      return exact ? nodeText === text : nodeText.includes(text);
-    });
-
-    return getClickableElement(match) || match;
   }
 
   async function getStatus() {
@@ -1466,6 +1616,7 @@
     return {
       id: recording.id,
       name: recording.name,
+      pagePath: getRecordingPath(recording),
       scope: recording.scope,
       savedAt: recording.savedAt,
       stepCount: (recording.steps || []).length,
@@ -1640,56 +1791,68 @@
       return;
     }
 
-    if (action === "start-record") {
-      await startRecording();
-    }
-
-    if (action === "stop-record") {
-      await stopRecording();
-    }
-
-    if (action === "stop-replay") {
-      stopReplay();
-    }
-
-    if (action === "replay") {
-      const id = event.target.getAttribute("data-ro-id");
-      await replayRecording(id);
-    }
-
-    if (action === "delete-recording") {
-      const id = event.target.getAttribute("data-ro-id");
-      await deleteRecording(id);
-    }
-
-    if (action === "view-recording") {
-      const id = event.target.getAttribute("data-ro-id");
-      await showRecordingDetail(id);
-    }
-
-    if (action === "close-detail") {
-      clearDetail();
-    }
-
-    if (action === "copy-detail") {
-      await copyCurrentDetail();
-    }
-
-    if (action === "search-recordings") {
-      applyRecordingFilters();
-      await renderRecordings();
-      await updatePanelMeta();
-    }
-
-    if (action === "clear-search") {
-      const keywordInput = panelRoot.querySelector("[data-ro-filter='keyword']");
-      if (keywordInput) {
-        keywordInput.value = "";
+    try {
+      if (action === "start-record") {
+        await startRecording();
       }
-      applyRecordingFilters();
-      await renderRecordings();
-      await updatePanelMeta();
+
+      if (action === "stop-record") {
+        await stopRecording();
+      }
+
+      if (action === "stop-replay") {
+        stopReplay();
+      }
+
+      if (action === "replay") {
+        const id = event.target.getAttribute("data-ro-id");
+        await replayRecording(id);
+      }
+
+      if (action === "delete-recording") {
+        const id = event.target.getAttribute("data-ro-id");
+        await deleteRecording(id);
+      }
+
+      if (action === "view-recording") {
+        const id = event.target.getAttribute("data-ro-id");
+        await showRecordingDetail(id);
+      }
+
+      if (action === "close-detail") {
+        clearDetail();
+      }
+
+      if (action === "copy-detail") {
+        await copyCurrentDetail();
+      }
+
+      if (action === "search-recordings") {
+        applyRecordingFilters();
+        await renderRecordings();
+        await updatePanelMeta();
+      }
+
+      if (action === "clear-search") {
+        const keywordInput = panelRoot.querySelector("[data-ro-filter='keyword']");
+        if (keywordInput) {
+          keywordInput.value = "";
+        }
+        applyRecordingFilters();
+        await renderRecordings();
+        await updatePanelMeta();
+      }
+    } catch (error) {
+      handlePanelActionError(error);
     }
+  }
+
+  function handlePanelActionError(error) {
+    const message = error && error.code === "RO_EXTENSION_CONTEXT_INVALIDATED"
+      ? "扩展上下文已失效，请刷新页面或重新加载扩展后再试。"
+      : `操作失败：${error && error.message ? error.message : "未知错误"}`;
+    updatePanelStatus(message, "error");
+    showToast(message, "error");
   }
 
   function applyRecordingFilters() {
@@ -1936,4 +2099,5 @@
   createPanel();
   initMessages();
   initRouteObserver();
+  resumePendingReplay();
 })();
